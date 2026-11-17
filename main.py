@@ -51,7 +51,7 @@ def zscore(close):
 def sized_buy(state):
     """The notional to spend: SIZE_BPS of the cash, halved until the modeled impact fits."""
     spend = state.cash * SIZE_BPS // BPS
-    minimum = state.hello["fees"]["min_notional_quote_units"]
+    minimum = int(state.hello["fees"]["min_notional_quote_units"])
     while spend >= minimum:
         impact = state.impact_bps(SYMBOL, spend)
         if impact is None or impact <= IMPACT_CAP_BPS:
