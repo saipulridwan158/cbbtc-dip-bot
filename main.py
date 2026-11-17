@@ -1,56 +1,75 @@
-"""cbBTC minute-bar mean-reversion bot (agent-fun/bars-replay/v1), Python 3.13 stdlib only.
+"""cbBTC minute-bar dip buyer (agent-fun/bars-replay/v1), Python 3.13 stdlib only.
 
-Strategy: rolling z-score mean reversion on 1-minute closes. When the latest close drops more
-TH_IN standard deviations below the trailing WINDOW-bar mean, buy with most of the cash (sized
-against the pool depth so impact + slippage stays under a cap); when z recovers above TH_OUT
-(meaning the price popped back toward/above the mean), sell the whole position. A hard time stop
-(MAX_HOLD) exits a stale position, and an equity stop exits if the position lost STOP_BPS of
-equity. Long only, one position, deterministic: no clock, no random, no environment.
+Strategy: buy a dip, sell the recovery. A rolling z-score of the 1-minute close against its
+trailing WINDOW-bar mean tells how far the latest bar sits from the recent range. When z drops
+below -TH_IN the bot buys, spending up to SIZE_BPS of its equity and sizing the order down until
+the pool's modeled price impact stays inside IMPACT_CAP_BPS. When z climbs back above TH_OUT, or
+the position is older than MAX_HOLD bars, or the position has lost STOP_BPS of its cost, the whole
+position is sold. Long only, one position at a time, never leveraged.
+
+Determinism: no clock, no environment, no randomness; floats are only a mean and a population
+standard deviation over a fixed window of integer closes, always in the same order, so two runs on
+the same bars produce the same orders byte for byte.
 """
 
 import os
-import sys
 import statistics
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
-WINDOW = 440          # trailing bars for mean/std
-TH_IN = 1.0           # buy when z below this
-TH_OUT = 3.5          # sell when z above this
-MAX_HOLD = 360        # bars; exit a position older than this
-STOP_BPS = 800        # exit if position value fell 8% below entry cost
-SIZE_BPS = 10000       # spend up to 95% of equity on a buy
-MAX_SLIP_BPS = 60     # max slippage+impact per order
-IMPACT_CAP_BPS = 25   # max modeled pool impact on a buy
+SYMBOL = "CBBTC"
+WINDOW = 440          # trailing bars the mean and the deviation are taken over
+TH_IN = 1.0           # buy when the close is this many deviations under the mean
+TH_OUT = 3.5          # sell once it is this many deviations over the mean
+MAX_HOLD = 360        # bars; a position older than this is sold at the next open
+MIN_HOLD = 5          # bars; never sell inside this, so one noisy bar cannot flip the position
+STOP_BPS = 800        # sell if the position's value falls 8% under what it cost
+SIZE_BPS = 10000      # spend at most this share of equity on a buy
+MAX_SLIP_BPS = 60     # refuse a fill more than 0.6% past the close the order was decided on
+IMPACT_CAP_BPS = 25   # size a buy down until its modeled pool impact is at most this
 BPS = 10_000
 
-seen = []             # closes history
-entry_cost = 0
-entry_bar = -1
-SYMBOL = "CBBTC"
+closes = []           # every close the bot has been sent, oldest first (trimmed to 2 windows)
+entry_cost = 0        # what the open position cost, in quote units
+entry_bar = -1        # the seq of the bar the buy was decided on
 
 
 def zscore(close):
-    if len(seen) < WINDOW + 1:
+    """How many population deviations the close sits from the trailing window's mean."""
+    if len(closes) < WINDOW + 1:
         return None
-    w = seen[-WINDOW:]
-    m = statistics.fmean(w)
-    sd = statistics.pstdev(w)
-    if sd == 0:
+    window = closes[-WINDOW:]
+    mean = statistics.fmean(window)
+    dev = statistics.pstdev(window)
+    if dev == 0:
         return None
-    return (close - m) / sd
+    return (close - mean) / dev
+
+
+def sized_buy(state):
+    """The notional to spend: SIZE_BPS of the cash, halved until the modeled impact fits."""
+    spend = state.cash * SIZE_BPS // BPS
+    minimum = state.hello["fees"]["min_notional_quote_units"]
+    while spend >= minimum:
+        impact = state.impact_bps(SYMBOL, spend)
+        if impact is None or impact <= IMPACT_CAP_BPS:
+            return spend
+        spend //= 2
+    return 0
 
 
 def on_batch(state, batch):
+    """One reply per bar: sell what the rules say to sell, else buy a dip, else nothing."""
     global entry_cost, entry_bar
     bar = state.latest.get(SYMBOL)
     if bar is None:
         return []
     close = int(bar["c"])
-    seen.append(close)
-    if len(seen) > WINDOW * 2:
-        del seen[:len(seen) - WINDOW * 2]
+    closes.append(close)
+    if len(closes) > WINDOW * 2:
+        del closes[: len(closes) - WINDOW * 2]
     if state.warming_up:
         return []
     z = zscore(close)
@@ -59,25 +78,16 @@ def on_batch(state, batch):
 
     held = state.positions.get(SYMBOL)
     if held is not None:
-        # exits first
-        val = state.value(SYMBOL, held.qty)
-        held_bars = state.seq - entry_bar
-        stop = entry_cost * (BPS - STOP_BPS) // BPS
-        if z > TH_OUT or held_bars >= MAX_HOLD or val <= stop:
+        value = state.value(SYMBOL, held.qty)
+        age = state.seq - entry_bar
+        floor = entry_cost * (BPS - STOP_BPS) // BPS
+        if (z > TH_OUT or age >= MAX_HOLD or value <= floor) and age >= MIN_HOLD:
             return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty, "max_slippage_bps": 200}]
         return []
 
     if z < -TH_IN:
-        # size against depth: impact of a trade worth a is a/D per hop; keep impact under half the slip cap
-        spend = state.cash * SIZE_BPS // BPS
-        # halve spend until its modeled impact is within the cap
-        while spend >= state.hello["fees"]["min_notional_quote_units"]:
-            imp = state.impact_bps(SYMBOL, spend)
-            if imp is None or imp <= IMPACT_CAP_BPS:
-                break
-            spend //= 2
-        min_notional = state.hello["fees"]["min_notional_quote_units"]
-        if spend < min_notional:
+        spend = sized_buy(state)
+        if spend <= 0:
             return []
         entry_cost = spend
         entry_bar = state.seq
@@ -88,6 +98,7 @@ def on_batch(state, batch):
 
 def on_hello(state):
     global entry_cost, entry_bar
+    closes.clear()
     entry_cost = 0
     entry_bar = -1
 
